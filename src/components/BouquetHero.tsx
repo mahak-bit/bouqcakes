@@ -19,6 +19,14 @@ import {
 } from "lucide-react";
 import { Button } from "./ui/Button";
 
+const TOTAL_FRAMES = 94;
+const FRAME_BASE_PATH = "/videos/frames/frame-";
+
+function getFrameUrl(indexZeroBased: number): string {
+  const num = Math.min(TOTAL_FRAMES, Math.max(1, indexZeroBased + 1));
+  return `${FRAME_BASE_PATH}${String(num).padStart(3, "0")}.webp`;
+}
+
 function subscribeReducedMotion(callback: () => void) {
   const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
   mq.addEventListener("change", callback);
@@ -42,8 +50,8 @@ export function BouquetHero({
   videoSrc = "/videos/cake.mp4",
   className = "",
 }: BouquetHeroProps) {
-  const sectionRef = useRef<HTMLElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const trackRef = useRef<HTMLElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Direct DOM refs for zero-re-render 60fps scroll choreography
   const introOverlayRef = useRef<HTMLDivElement>(null);
@@ -51,115 +59,284 @@ export function BouquetHero({
   const vignetteRef = useRef<HTMLDivElement>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
 
-  // Scrubbing refs
-  const targetTimeRef = useRef<number>(0);
+  // Frame sequence storage & animation refs
+  const imagesRef = useRef<(HTMLImageElement | null)[]>(
+    Array.from({ length: TOTAL_FRAMES }, () => null)
+  );
+  const targetFrameRef = useRef<number>(0);
+  const displayFrameRef = useRef<number>(0);
+  const lastDrawnFrameRef = useRef<number>(-1);
   const rafIdRef = useRef<number | null>(null);
-  const hasPrimedRef = useRef<boolean>(false);
+  const reducedPlayRafRef = useRef<number | null>(null);
 
   // State
-  const [videoDuration, setVideoDuration] = useState<number>(0);
-  const [isVideoLoaded, setIsVideoLoaded] = useState<boolean>(false);
+  const [isReady, setIsReady] = useState<boolean>(false);
   const [hasError, setHasError] = useState<boolean>(false);
   const [isPlayingReduced, setIsPlayingReduced] = useState<boolean>(false);
+  const [retryTick, setRetryTick] = useState<number>(0);
 
-  // 1. Hydration-safe reduced-motion subscription (React 19 idiomatic)
+  // Hydration-safe reduced-motion subscription
   const isReducedMotion = useSyncExternalStore(
     subscribeReducedMotion,
     getReducedMotionSnapshot,
     getReducedMotionServerSnapshot
   );
 
-  // 2. Hydration-safe video metadata detection
-  const markVideoReady = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
+  // Find closest decoded frame so fast scrolling on slow mobile networks never flashes blank
+  const getBestFrame = useCallback((desiredIndex: number): HTMLImageElement | null => {
+    const imgs = imagesRef.current;
+    const clamped = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(desiredIndex)));
+    const exact = imgs[clamped];
+    if (exact && exact.complete && exact.naturalWidth > 0) {
+      return exact;
+    }
 
-    const duration = video.duration;
-    if (duration && Number.isFinite(duration) && duration > 0) {
-      setVideoDuration(duration);
-      setIsVideoLoaded(true);
-      setHasError(false);
-
-      // Ensure video never autoplays
-      video.pause();
-
-      // Prime first frame once so the opening frame is painted cleanly
-      if (!hasPrimedRef.current) {
-        hasPrimedRef.current = true;
-        try {
-          video.currentTime = 0.001;
-        } catch {
-          // Ignore seek errors during initialization
+    for (let offset = 1; offset < TOTAL_FRAMES; offset++) {
+      const prev = clamped - offset;
+      if (prev >= 0) {
+        const candidate = imgs[prev];
+        if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+          return candidate;
+        }
+      }
+      const next = clamped + offset;
+      if (next < TOTAL_FRAMES) {
+        const candidate = imgs[next];
+        if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+          return candidate;
         }
       }
     }
+    return null;
   }, []);
 
-  const handleVideoError = useCallback(() => {
-    setHasError(true);
-    setIsVideoLoaded(false);
-  }, []);
+  // Responsive canvas renderer: full-bleed cover on landscape, full-bouquet seamless cinema framing on portrait phones
+  const drawFrameToCanvas = useCallback(
+    (frameIndex: number, forceRedraw = false) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
 
-  const handleRetry = useCallback(() => {
-    hasPrimedRef.current = false;
-    setHasError(false);
-    setIsVideoLoaded(false);
-    const video = videoRef.current;
-    if (video) {
-      video.load();
-    }
-  }, []);
+      const rounded = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(frameIndex)));
+      if (!forceRedraw && rounded === lastDrawnFrameRef.current) return;
 
+      const img = getBestFrame(rounded);
+      if (!img) return;
+
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) return;
+
+      const cw = canvas.width;
+      const ch = canvas.height;
+      if (cw === 0 || ch === 0) return;
+
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      if (iw === 0 || ih === 0) return;
+
+      const isPortrait = ch > cw * 1.05;
+
+      if (isPortrait) {
+        // Seamless studio backdrop matching cake.mp4's warm taupe-champagne studio sweep
+        const bgGrad = ctx.createLinearGradient(0, 0, 0, ch);
+        bgGrad.addColorStop(0, "#9E8E78");
+        bgGrad.addColorStop(0.5, "#B0A18B");
+        bgGrad.addColorStop(1, "#C9BEAA");
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, cw, ch);
+
+        // Smart portrait scale: keeps 100% of the bouquet, piping nozzle, & cherry bow clearly visible on narrow phone screens
+        const scale = Math.max(cw / (iw * 0.72), (ch * 0.62) / ih);
+        const dw = iw * scale;
+        const dh = ih * scale;
+        const dx = (cw - dw) / 2;
+        const dy = (ch - dh) / 2 + ch * 0.01;
+
+        ctx.drawImage(img, dx, dy, dw, dh);
+
+        // Soft feathered top & bottom blend so the frame merges seamlessly into the studio backdrop
+        const feather = Math.max(24, Math.min(72, ch * 0.08));
+        if (dy > 0) {
+          const topFade = ctx.createLinearGradient(0, dy - 2, 0, dy + feather);
+          topFade.addColorStop(0, "#A4957F");
+          topFade.addColorStop(1, "rgba(164, 149, 127, 0)");
+          ctx.fillStyle = topFade;
+          ctx.fillRect(0, dy - 2, cw, feather + 4);
+        }
+        const bottomEdge = dy + dh;
+        if (bottomEdge < ch) {
+          const botFade = ctx.createLinearGradient(
+            0,
+            bottomEdge - feather,
+            0,
+            bottomEdge + 2
+          );
+          botFade.addColorStop(0, "rgba(195, 184, 165, 0)");
+          botFade.addColorStop(1, "#C3B8A5");
+          ctx.fillStyle = botFade;
+          ctx.fillRect(0, bottomEdge - feather, cw, feather + 4);
+        }
+      } else {
+        // Landscape (tablets, laptops, desktops): crisp full-bleed object-fit: cover
+        const scale = Math.max(cw / iw, ch / ih);
+        const dw = iw * scale;
+        const dh = ih * scale;
+        const dx = (cw - dw) / 2;
+        const dy = (ch - dh) / 2;
+        ctx.drawImage(img, dx, dy, dw, dh);
+      }
+
+      lastDrawnFrameRef.current = rounded;
+    },
+    [getBestFrame]
+  );
+
+  // Keep canvas resolution razor-sharp across screen resizes & orientation changes
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    // Critical for Next.js SSR: the browser may have loaded metadata BEFORE React hydrated
-    if (video.readyState >= 1) {
-      markVideoReady();
-    } else if (video.networkState === 0) {
-      video.load();
+    const resizeCanvas = () => {
+      const parent = canvas.parentElement;
+      if (!parent) return;
+      const rect = parent.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const nextW = Math.max(1, Math.round(rect.width * dpr));
+      const nextH = Math.max(1, Math.round(rect.height * dpr));
+
+      if (canvas.width !== nextW || canvas.height !== nextH) {
+        canvas.width = nextW;
+        canvas.height = nextH;
+        drawFrameToCanvas(displayFrameRef.current, true);
+      }
+    };
+
+    resizeCanvas();
+
+    const observer = new ResizeObserver(resizeCanvas);
+    if (canvas.parentElement) {
+      observer.observe(canvas.parentElement);
     }
-
-    video.addEventListener("loadedmetadata", markVideoReady);
-    video.addEventListener("durationchange", markVideoReady);
-    video.addEventListener("loadeddata", markVideoReady);
-    video.addEventListener("canplay", markVideoReady);
-    video.addEventListener("error", handleVideoError);
+    window.addEventListener("orientationchange", resizeCanvas);
 
     return () => {
-      video.removeEventListener("loadedmetadata", markVideoReady);
-      video.removeEventListener("durationchange", markVideoReady);
-      video.removeEventListener("loadeddata", markVideoReady);
-      video.removeEventListener("canplay", markVideoReady);
-      video.removeEventListener("error", handleVideoError);
+      observer.disconnect();
+      window.removeEventListener("orientationchange", resizeCanvas);
     };
-  }, [videoSrc, markVideoReady, handleVideoError]);
+  }, [drawFrameToCanvas]);
 
-  // 3. Dedicated requestAnimationFrame loop for efficient video seeking
+  // Progressive 2-wave preloader: instant frame 1 -> keyframes -> smooth fill-in
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !isVideoLoaded || isReducedMotion) return;
+    let cancelled = false;
+    imagesRef.current = Array.from({ length: TOTAL_FRAMES }, () => null);
+    lastDrawnFrameRef.current = -1;
 
-    const seekLoop = () => {
-      if (video.readyState >= 1) {
-        const target = targetTimeRef.current;
-        const current = video.currentTime;
-        const delta = Math.abs(current - target);
-
-        // Use native video.seeking to avoid overwhelming the decoder
-        if (!video.seeking && delta > 0.015) {
-          try {
-            video.currentTime = target;
-          } catch {
-            // Ignore aborted seeks
-          }
+    const loadSingleFrame = (idx: number): Promise<boolean> => {
+      return new Promise((resolve) => {
+        if (cancelled) {
+          resolve(false);
+          return;
         }
-      }
-      rafIdRef.current = requestAnimationFrame(seekLoop);
+        const img = new window.Image();
+        img.decoding = "async";
+        img.src = getFrameUrl(idx);
+
+        img.onload = () => {
+          if (cancelled) {
+            resolve(false);
+            return;
+          }
+          imagesRef.current[idx] = img;
+          // If this frame is currently displayed (or very close), refresh canvas cleanly
+          if (Math.abs(displayFrameRef.current - idx) <= 2) {
+            drawFrameToCanvas(displayFrameRef.current, true);
+          }
+          resolve(true);
+        };
+
+        img.onerror = () => {
+          resolve(false);
+        };
+      });
     };
 
-    rafIdRef.current = requestAnimationFrame(seekLoop);
+    const runPreload = async () => {
+      // Wave 0: Load opening frame & final frame immediately so hero paints in <100ms
+      const initialIdx = isReducedMotion ? TOTAL_FRAMES - 1 : 0;
+      const [firstOk] = await Promise.all([
+        loadSingleFrame(initialIdx),
+        loadSingleFrame(isReducedMotion ? 0 : TOTAL_FRAMES - 1),
+      ]);
+
+      if (cancelled) return;
+
+      if (!firstOk) {
+        setHasError(true);
+        setIsReady(false);
+        return;
+      }
+
+      displayFrameRef.current = initialIdx;
+      targetFrameRef.current = initialIdx;
+      setHasError(false);
+      setIsReady(true);
+      drawFrameToCanvas(initialIdx, true);
+
+      // Wave 1: Load every 4th frame first so full-range scrubbing is immediately smooth on mobile
+      const wave1: number[] = [];
+      const wave2: number[] = [];
+      for (let i = 1; i < TOTAL_FRAMES - 1; i++) {
+        if (i % 4 === 0) wave1.push(i);
+        else wave2.push(i);
+      }
+
+      const loadInBatches = async (indices: number[], concurrency: number) => {
+        let cursor = 0;
+        const worker = async () => {
+          while (!cancelled && cursor < indices.length) {
+            const nextIdx = indices[cursor++];
+            await loadSingleFrame(nextIdx);
+          }
+        };
+        await Promise.all(
+          Array.from({ length: Math.min(concurrency, indices.length) }, worker)
+        );
+      };
+
+      await loadInBatches(wave1, 6);
+      if (cancelled) return;
+      await loadInBatches(wave2, 6);
+    };
+
+    runPreload();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isReducedMotion, retryTick, drawFrameToCanvas]);
+
+  // Silky 60fps requestAnimationFrame loop with smooth exponential damping
+  useEffect(() => {
+    if (!isReady || isReducedMotion) return;
+
+    const tick = () => {
+      const target = targetFrameRef.current;
+      const current = displayFrameRef.current;
+      const diff = target - current;
+
+      if (Math.abs(diff) > 0.04) {
+        // Smooth damping makes touch flicks & wheel notches feel cinema-fluid
+        const next = current + diff * 0.24;
+        displayFrameRef.current = next;
+        drawFrameToCanvas(next);
+      } else if (Math.round(current) !== Math.round(target)) {
+        displayFrameRef.current = target;
+        drawFrameToCanvas(target);
+      }
+
+      rafIdRef.current = requestAnimationFrame(tick);
+    };
+
+    rafIdRef.current = requestAnimationFrame(tick);
 
     return () => {
       if (rafIdRef.current !== null) {
@@ -167,37 +344,25 @@ export function BouquetHero({
         rafIdRef.current = null;
       }
     };
-  }, [isVideoLoaded, isReducedMotion]);
+  }, [isReady, isReducedMotion, drawFrameToCanvas]);
 
-  // 4. GSAP ScrollTrigger pinning + scroll progress -> video.currentTime & text reveals
+  // GSAP ScrollTrigger over native CSS sticky track (zero mobile pin jitter!)
   useEffect(() => {
-    if (
-      typeof window === "undefined" ||
-      !isVideoLoaded ||
-      isReducedMotion ||
-      videoDuration <= 0
-    ) {
-      return;
-    }
+    if (typeof window === "undefined" || !isReady || isReducedMotion) return;
 
     gsap.registerPlugin(ScrollTrigger);
 
-    const section = sectionRef.current;
-    const video = videoRef.current;
-    if (!section || !video) return;
-
-    // Leave a tiny safety buffer before EOF so browsers hold the final assembled frame
-    const maxSafeTime = Math.max(0, videoDuration - 0.05);
+    const track = trackRef.current;
+    if (!track) return;
 
     const ctx = gsap.context(() => {
-      // Set initial visual states
       if (introOverlayRef.current) {
         gsap.set(introOverlayRef.current, { opacity: 1, y: 0 });
       }
       if (finalOverlayRef.current) {
         gsap.set(finalOverlayRef.current, {
           opacity: 0,
-          y: 28,
+          y: 26,
           scale: 0.97,
           pointerEvents: "none",
         });
@@ -206,22 +371,22 @@ export function BouquetHero({
         gsap.set(vignetteRef.current, { opacity: 0.08 });
       }
       if (progressBarRef.current) {
-        gsap.set(progressBarRef.current, { scaleX: 0, transformOrigin: "left center" });
+        gsap.set(progressBarRef.current, {
+          scaleX: 0,
+          transformOrigin: "left center",
+        });
       }
 
       const tl = gsap.timeline({
         scrollTrigger: {
-          trigger: section,
+          trigger: track,
           start: "top top",
-          end: () => (window.innerWidth < 768 ? "+=220%" : "+=300%"),
-          pin: true,
-          pinSpacing: true,
+          end: "bottom bottom",
           scrub: true,
-          anticipatePin: 1,
           invalidateOnRefresh: true,
           onUpdate: (self) => {
             const progress = Math.max(0, Math.min(1, self.progress));
-            targetTimeRef.current = progress * maxSafeTime;
+            targetFrameRef.current = progress * (TOTAL_FRAMES - 1);
 
             if (finalOverlayRef.current) {
               finalOverlayRef.current.style.pointerEvents =
@@ -231,31 +396,26 @@ export function BouquetHero({
         },
       });
 
-      // Timeline normalized from 0 to 1
-      // Progress bar tracks full 0 -> 1 scroll duration
       if (progressBarRef.current) {
         tl.to(progressBarRef.current, { scaleX: 1, ease: "none", duration: 1 }, 0);
       }
 
-      // Intro cue & scroll indicator gently fade away as scrubbing starts (0 -> 0.14)
       if (introOverlayRef.current) {
         tl.to(
           introOverlayRef.current,
-          { opacity: 0, y: -24, ease: "power1.out", duration: 0.14 },
+          { opacity: 0, y: -22, ease: "power1.out", duration: 0.14 },
           0
         );
       }
 
-      // Subtle warm vignette deepens slightly near completion for crisp editorial contrast (0.76 -> 0.95)
       if (vignetteRef.current) {
         tl.to(
           vignetteRef.current,
-          { opacity: 0.52, ease: "power1.inOut", duration: 0.2 },
+          { opacity: 0.54, ease: "power1.inOut", duration: 0.2 },
           0.76
         );
       }
 
-      // Reveal the final finished bouquet headline & CTA once the bouquet completes (0.82 -> 0.98)
       if (finalOverlayRef.current) {
         tl.to(
           finalOverlayRef.current,
@@ -263,45 +423,63 @@ export function BouquetHero({
           0.82
         );
       }
-    }, section);
+    }, track);
 
-    // Ensure ScrollTrigger recalculates page geometry right after pin creation
     ScrollTrigger.refresh();
 
     return () => {
       ctx.revert();
     };
-  }, [isVideoLoaded, videoDuration, isReducedMotion]);
+  }, [isReady, isReducedMotion]);
 
-  // 5. Reduced-motion: show the finished bouquet frame & reveal text immediately
+  // Accessible manual playback for reduced-motion users
   useEffect(() => {
-    const video = videoRef.current;
-    if (!isReducedMotion || !isVideoLoaded || !video || videoDuration <= 0) return;
-
-    try {
-      video.currentTime = Math.max(0, videoDuration - 0.05);
-    } catch {
-      // Ignore seek error
-    }
-  }, [isReducedMotion, isVideoLoaded, videoDuration]);
-
-  const handleTogglePlayReduced = () => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (isPlayingReduced) {
-      video.pause();
-      setIsPlayingReduced(false);
-    } else {
-      if (video.currentTime >= video.duration - 0.1) {
-        video.currentTime = 0;
+    if (!isReducedMotion || !isPlayingReduced) {
+      if (reducedPlayRafRef.current !== null) {
+        cancelAnimationFrame(reducedPlayRafRef.current);
+        reducedPlayRafRef.current = null;
       }
-      video
-        .play()
-        .then(() => setIsPlayingReduced(true))
-        .catch(() => setIsPlayingReduced(false));
+      return;
     }
-  };
+
+    let lastTimestamp = performance.now();
+    const frameIntervalMs = 1000 / 15;
+
+    if (displayFrameRef.current >= TOTAL_FRAMES - 1) {
+      displayFrameRef.current = 0;
+    }
+
+    const step = (now: number) => {
+      if (now - lastTimestamp >= frameIntervalMs) {
+        lastTimestamp = now;
+        const next = displayFrameRef.current + 1;
+        if (next >= TOTAL_FRAMES) {
+          displayFrameRef.current = TOTAL_FRAMES - 1;
+          drawFrameToCanvas(TOTAL_FRAMES - 1, true);
+          setIsPlayingReduced(false);
+          return;
+        }
+        displayFrameRef.current = next;
+        drawFrameToCanvas(next);
+      }
+      reducedPlayRafRef.current = requestAnimationFrame(step);
+    };
+
+    reducedPlayRafRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (reducedPlayRafRef.current !== null) {
+        cancelAnimationFrame(reducedPlayRafRef.current);
+        reducedPlayRafRef.current = null;
+      }
+    };
+  }, [isReducedMotion, isPlayingReduced, drawFrameToCanvas]);
+
+  const handleRetry = useCallback(() => {
+    setHasError(false);
+    setIsReady(false);
+    setRetryTick((t) => t + 1);
+  }, []);
 
   const handleSmoothAnchor = (
     e: React.MouseEvent<HTMLAnchorElement>,
@@ -316,25 +494,20 @@ export function BouquetHero({
 
   return (
     <section
-      ref={sectionRef}
+      ref={trackRef}
+      data-video-source={videoSrc}
       aria-label="Bouqcakes Edible Floral Bouquet Assembly"
-      className={`relative w-full h-svh min-h-[540px] overflow-hidden bg-[#F5EEE5] ${className}`}
+      className={`relative w-full bg-[#9E8E78] ${
+        isReducedMotion ? "h-svh min-h-[540px]" : "h-[260svh] md:h-[300svh] lg:h-[340vh]"
+      } ${className}`}
     >
-      {/* Full-Bleed HTML5 Video Stage */}
-      <div className="relative w-full h-full overflow-hidden bg-[#F5EEE5]">
-        <video
-          ref={videoRef}
-          src={videoSrc}
-          muted
-          playsInline
-          preload="auto"
-          disablePictureInPicture
-          controls={false}
-          onLoadedMetadata={markVideoReady}
-          onCanPlay={markVideoReady}
-          onError={handleVideoError}
-          onEnded={() => setIsPlayingReduced(false)}
-          className="w-full h-full object-cover object-center select-none pointer-events-none"
+      {/* Native GPU-Composited Sticky Stage — silky smooth on every iPhone, Android, tablet, and desktop */}
+      <div className="sticky top-0 left-0 w-full h-svh min-h-[540px] overflow-hidden bg-[#9E8E78]">
+        {/* Interactive Canvas Sequence Stage */}
+        <canvas
+          ref={canvasRef}
+          className="block w-full h-full select-none pointer-events-none"
+          aria-hidden="true"
         />
 
         {/* Deep Burgundy editorial contrast veil (animates in at final reveal) */}
@@ -347,7 +520,7 @@ export function BouquetHero({
 
         {/* Soft architectural framing shadow */}
         <div
-          className="absolute inset-0 pointer-events-none shadow-[inset_0_0_120px_rgba(41,35,33,0.22)]"
+          className="absolute inset-0 pointer-events-none shadow-[inset_0_0_110px_rgba(41,35,33,0.22)]"
           aria-hidden="true"
         />
 
@@ -358,7 +531,7 @@ export function BouquetHero({
             className="absolute inset-0 z-20 pointer-events-none flex flex-col justify-end items-center px-5 sm:px-8 pb-6 sm:pb-9"
           >
             <div className="flex flex-col items-center gap-2.5">
-              <div className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-[#F5EEE5]/90 backdrop-blur-md border border-[#D9B9B2]">
+              <div className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-[#F5EEE5]/92 backdrop-blur-md border border-[#D9B9B2]">
                 <span className="font-sans text-[10px] sm:text-[11px] uppercase tracking-[0.24em] text-[#292321] font-medium">
                   Scroll to Assemble
                 </span>
@@ -426,10 +599,11 @@ export function BouquetHero({
         )}
 
         {/* Reduced-Motion Accessible Playback Toggle */}
-        {isReducedMotion && isVideoLoaded && (
+        {isReducedMotion && isReady && (
           <div className="absolute bottom-6 right-6 z-30">
             <button
-              onClick={handleTogglePlayReduced}
+              type="button"
+              onClick={() => setIsPlayingReduced((prev) => !prev)}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-[#F5EEE5]/92 backdrop-blur-md text-[#292321] border border-[#D9B9B2] font-sans text-[11px] uppercase tracking-[0.2em] hover:bg-[#8F1728] hover:text-[#F5EEE5] hover:border-[#8F1728] transition-colors cursor-pointer"
             >
               {isPlayingReduced ? (
@@ -447,8 +621,8 @@ export function BouquetHero({
           </div>
         )}
 
-        {/* LOADING STATE: Shown cleanly until video metadata is available */}
-        {!isVideoLoaded && !hasError && (
+        {/* LOADING STATE: Brief champagne preloader until frame 1 (10 KB) is painted */}
+        {!isReady && !hasError && (
           <div className="absolute inset-0 z-40 bg-[#F5EEE5] flex flex-col items-center justify-center p-6 text-center">
             <div className="relative w-14 h-14 mb-5 flex items-center justify-center">
               <div className="absolute inset-0 rounded-full border-2 border-[#D9B9B2] border-t-[#8F1728] animate-spin" />
@@ -463,7 +637,7 @@ export function BouquetHero({
           </div>
         )}
 
-        {/* ERROR STATE: Graceful fallback if video fails to load */}
+        {/* ERROR STATE: Graceful fallback if frames fail to load */}
         {hasError && (
           <div className="absolute inset-0 z-40 bg-[#F5EEE5] flex flex-col items-center justify-center p-8 text-center">
             <div className="max-w-md mx-auto flex flex-col items-center">
@@ -474,8 +648,8 @@ export function BouquetHero({
                 Flowers you can savour.
               </p>
               <p className="font-sans text-xs text-[#5E514D] leading-relaxed mb-6">
-                We could not load the bouquet assembly video at this moment.
-                Please retry below.
+                We could not load the bouquet assembly right now. Please retry
+                below.
               </p>
               <Button
                 onClick={handleRetry}
@@ -483,7 +657,7 @@ export function BouquetHero({
                 size="sm"
                 icon={<RotateCcw className="w-3.5 h-3.5" />}
               >
-                Retry Video
+                Retry
               </Button>
             </div>
           </div>

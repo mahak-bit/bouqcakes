@@ -41,6 +41,19 @@ function getReducedMotionServerSnapshot() {
   return false;
 }
 
+interface CachedPortraitLayout {
+  cw: number;
+  ch: number;
+  bgGrad: CanvasGradient;
+  topFade: CanvasGradient | null;
+  botFade: CanvasGradient | null;
+  dx: number;
+  dy: number;
+  dw: number;
+  dh: number;
+  feather: number;
+}
+
 interface BouquetHeroProps {
   videoSrc?: string;
   className?: string;
@@ -52,6 +65,9 @@ export function BouquetHero({
 }: BouquetHeroProps) {
   const trackRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const cachedPortraitRef = useRef<CachedPortraitLayout | null>(null);
+  const lastSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
 
   // Direct DOM refs for zero-re-render 60fps scroll choreography
   const introOverlayRef = useRef<HTMLDivElement>(null);
@@ -68,6 +84,7 @@ export function BouquetHero({
   const lastDrawnFrameRef = useRef<number>(-1);
   const rafIdRef = useRef<number | null>(null);
   const reducedPlayRafRef = useRef<number | null>(null);
+  const isMountedRef = useRef<boolean>(true);
 
   // State
   const [isReady, setIsReady] = useState<boolean>(false);
@@ -82,48 +99,68 @@ export function BouquetHero({
     getReducedMotionServerSnapshot
   );
 
-  // Find closest decoded frame so fast scrolling on slow mobile networks never flashes blank
-  const getBestFrame = useCallback((desiredIndex: number): HTMLImageElement | null => {
-    const imgs = imagesRef.current;
-    const clamped = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(desiredIndex)));
-    const exact = imgs[clamped];
-    if (exact && exact.complete && exact.naturalWidth > 0) {
-      return exact;
-    }
-
-    for (let offset = 1; offset < TOTAL_FRAMES; offset++) {
-      const prev = clamped - offset;
-      if (prev >= 0) {
-        const candidate = imgs[prev];
-        if (candidate && candidate.complete && candidate.naturalWidth > 0) {
-          return candidate;
-        }
-      }
-      const next = clamped + offset;
-      if (next < TOTAL_FRAMES) {
-        const candidate = imgs[next];
-        if (candidate && candidate.complete && candidate.naturalWidth > 0) {
-          return candidate;
-        }
-      }
-    }
-    return null;
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
   }, []);
 
-  // Responsive canvas renderer: full-bleed cover on landscape, full-bouquet seamless cinema framing on portrait phones
+  // Find closest pre-decoded frame so fast scrolling on slow connections never flashes blank
+  const getBestFrame = useCallback(
+    (desiredIndex: number): HTMLImageElement | null => {
+      const imgs = imagesRef.current;
+      const clamped = Math.min(
+        TOTAL_FRAMES - 1,
+        Math.max(0, Math.round(desiredIndex))
+      );
+      const exact = imgs[clamped];
+      if (exact && exact.complete && exact.naturalWidth > 0) {
+        return exact;
+      }
+
+      for (let offset = 1; offset < TOTAL_FRAMES; offset++) {
+        const prev = clamped - offset;
+        if (prev >= 0) {
+          const candidate = imgs[prev];
+          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+            return candidate;
+          }
+        }
+        const next = clamped + offset;
+        if (next < TOTAL_FRAMES) {
+          const candidate = imgs[next];
+          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+            return candidate;
+          }
+        }
+      }
+      return null;
+    },
+    []
+  );
+
+  // Zero-allocation 60fps canvas renderer with cached gradients & smart portrait/landscape framing
   const drawFrameToCanvas = useCallback(
     (frameIndex: number, forceRedraw = false) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      const rounded = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(frameIndex)));
+      const rounded = Math.min(
+        TOTAL_FRAMES - 1,
+        Math.max(0, Math.round(frameIndex))
+      );
       if (!forceRedraw && rounded === lastDrawnFrameRef.current) return;
 
       const img = getBestFrame(rounded);
       if (!img) return;
 
-      const ctx = canvas.getContext("2d", { alpha: false });
-      if (!ctx) return;
+      let ctx = ctxRef.current;
+      if (!ctx) {
+        ctx = canvas.getContext("2d", { alpha: false });
+        if (!ctx) return;
+        ctxRef.current = ctx;
+      }
 
       const cw = canvas.width;
       const ch = canvas.height;
@@ -136,44 +173,67 @@ export function BouquetHero({
       const isPortrait = ch > cw * 1.05;
 
       if (isPortrait) {
-        // Seamless studio backdrop matching cake.mp4's warm taupe-champagne studio sweep
-        const bgGrad = ctx.createLinearGradient(0, 0, 0, ch);
-        bgGrad.addColorStop(0, "#9E8E78");
-        bgGrad.addColorStop(0.5, "#B0A18B");
-        bgGrad.addColorStop(1, "#C9BEAA");
-        ctx.fillStyle = bgGrad;
-        ctx.fillRect(0, 0, cw, ch);
+        let layout = cachedPortraitRef.current;
+        if (!layout || layout.cw !== cw || layout.ch !== ch) {
+          const bgGrad = ctx.createLinearGradient(0, 0, 0, ch);
+          bgGrad.addColorStop(0, "#9E8E78");
+          bgGrad.addColorStop(0.5, "#B0A18B");
+          bgGrad.addColorStop(1, "#C9BEAA");
 
-        // Smart portrait scale: keeps 100% of the bouquet, piping nozzle, & cherry bow clearly visible on narrow phone screens
-        const scale = Math.max(cw / (iw * 0.72), (ch * 0.62) / ih);
-        const dw = iw * scale;
-        const dh = ih * scale;
-        const dx = (cw - dw) / 2;
-        const dy = (ch - dh) / 2 + ch * 0.01;
+          const scale = Math.max(cw / (iw * 0.72), (ch * 0.62) / ih);
+          const dw = iw * scale;
+          const dh = ih * scale;
+          const dx = (cw - dw) / 2;
+          const dy = (ch - dh) / 2 + ch * 0.01;
+          const feather = Math.max(24, Math.min(72, ch * 0.08));
 
-        ctx.drawImage(img, dx, dy, dw, dh);
+          let topFade: CanvasGradient | null = null;
+          if (dy > 0) {
+            topFade = ctx.createLinearGradient(0, dy - 2, 0, dy + feather);
+            topFade.addColorStop(0, "#A4957F");
+            topFade.addColorStop(1, "rgba(164, 149, 127, 0)");
+          }
 
-        // Soft feathered top & bottom blend so the frame merges seamlessly into the studio backdrop
-        const feather = Math.max(24, Math.min(72, ch * 0.08));
-        if (dy > 0) {
-          const topFade = ctx.createLinearGradient(0, dy - 2, 0, dy + feather);
-          topFade.addColorStop(0, "#A4957F");
-          topFade.addColorStop(1, "rgba(164, 149, 127, 0)");
-          ctx.fillStyle = topFade;
-          ctx.fillRect(0, dy - 2, cw, feather + 4);
+          let botFade: CanvasGradient | null = null;
+          const bottomEdge = dy + dh;
+          if (bottomEdge < ch) {
+            botFade = ctx.createLinearGradient(
+              0,
+              bottomEdge - feather,
+              0,
+              bottomEdge + 2
+            );
+            botFade.addColorStop(0, "rgba(195, 184, 165, 0)");
+            botFade.addColorStop(1, "#C3B8A5");
+          }
+
+          layout = {
+            cw,
+            ch,
+            bgGrad,
+            topFade,
+            botFade,
+            dx,
+            dy,
+            dw,
+            dh,
+            feather,
+          };
+          cachedPortraitRef.current = layout;
         }
-        const bottomEdge = dy + dh;
-        if (bottomEdge < ch) {
-          const botFade = ctx.createLinearGradient(
-            0,
-            bottomEdge - feather,
-            0,
-            bottomEdge + 2
-          );
-          botFade.addColorStop(0, "rgba(195, 184, 165, 0)");
-          botFade.addColorStop(1, "#C3B8A5");
-          ctx.fillStyle = botFade;
-          ctx.fillRect(0, bottomEdge - feather, cw, feather + 4);
+
+        ctx.fillStyle = layout.bgGrad;
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.drawImage(img, layout.dx, layout.dy, layout.dw, layout.dh);
+
+        if (layout.topFade) {
+          ctx.fillStyle = layout.topFade;
+          ctx.fillRect(0, layout.dy - 2, cw, layout.feather + 4);
+        }
+        if (layout.botFade) {
+          const bottomEdge = layout.dy + layout.dh;
+          ctx.fillStyle = layout.botFade;
+          ctx.fillRect(0, bottomEdge - layout.feather, cw, layout.feather + 4);
         }
       } else {
         // Landscape (tablets, laptops, desktops): crisp full-bleed object-fit: cover
@@ -190,41 +250,98 @@ export function BouquetHero({
     [getBestFrame]
   );
 
-  // Keep canvas resolution razor-sharp across screen resizes & orientation changes
+  // On-demand 60fps rAF damping loop: runs ONLY while scrubbing, idles at 0% CPU when stopped
+  const scheduleRender = useCallback(() => {
+    if (rafIdRef.current !== null) return;
+
+    const tick = () => {
+      if (!isMountedRef.current) {
+        rafIdRef.current = null;
+        return;
+      }
+
+      const target = targetFrameRef.current;
+      const current = displayFrameRef.current;
+      const diff = target - current;
+
+      if (Math.abs(diff) > 0.05) {
+        const next = current + diff * 0.28;
+        displayFrameRef.current = next;
+        drawFrameToCanvas(next);
+        rafIdRef.current = requestAnimationFrame(tick);
+      } else {
+        displayFrameRef.current = target;
+        drawFrameToCanvas(target);
+        rafIdRef.current = null;
+      }
+    };
+
+    rafIdRef.current = requestAnimationFrame(tick);
+  }, [drawFrameToCanvas]);
+
+  // Cancel any pending rAF on unmount
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
+
+  // Keep canvas sharp while ignoring mobile browser URL-bar height micro-jitter
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const resizeCanvas = () => {
+    const resizeCanvas = (force = false) => {
       const parent = canvas.parentElement;
       if (!parent) return;
       const rect = parent.getBoundingClientRect();
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const nextW = Math.max(1, Math.round(rect.width * dpr));
-      const nextH = Math.max(1, Math.round(rect.height * dpr));
+      const cssW = Math.round(rect.width);
+      const cssH = Math.round(rect.height);
+
+      // Ignore minor vertical-only mobile address-bar resizes during touch scrolling
+      if (
+        !force &&
+        lastSizeRef.current.w === cssW &&
+        Math.abs(lastSizeRef.current.h - cssH) < 120 &&
+        cssW < 768
+      ) {
+        return;
+      }
+
+      lastSizeRef.current = { w: cssW, h: cssH };
+      const maxDpr = cssW < 768 ? 1.5 : 2;
+      const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
+      const nextW = Math.max(1, Math.round(cssW * dpr));
+      const nextH = Math.max(1, Math.round(cssH * dpr));
 
       if (canvas.width !== nextW || canvas.height !== nextH) {
         canvas.width = nextW;
         canvas.height = nextH;
+        cachedPortraitRef.current = null;
         drawFrameToCanvas(displayFrameRef.current, true);
       }
     };
 
-    resizeCanvas();
+    resizeCanvas(true);
 
-    const observer = new ResizeObserver(resizeCanvas);
+    const observer = new ResizeObserver(() => resizeCanvas(false));
     if (canvas.parentElement) {
       observer.observe(canvas.parentElement);
     }
-    window.addEventListener("orientationchange", resizeCanvas);
+
+    const handleOrientation = () => resizeCanvas(true);
+    window.addEventListener("orientationchange", handleOrientation);
 
     return () => {
       observer.disconnect();
-      window.removeEventListener("orientationchange", resizeCanvas);
+      window.removeEventListener("orientationchange", handleOrientation);
     };
   }, [drawFrameToCanvas]);
 
-  // Progressive 2-wave preloader: instant frame 1 -> keyframes -> smooth fill-in
+  // Progressive 2-wave preloader with async off-thread img.decode() (zero first-scroll stutter)
   useEffect(() => {
     let cancelled = false;
     imagesRef.current = Array.from({ length: TOTAL_FRAMES }, () => null);
@@ -240,13 +357,24 @@ export function BouquetHero({
         img.decoding = "async";
         img.src = getFrameUrl(idx);
 
-        img.onload = () => {
+        img.onload = async () => {
+          if (cancelled) {
+            resolve(false);
+            return;
+          }
+          // Pre-decode bitmap off main thread so drawImage never causes frame drops
+          if (typeof img.decode === "function") {
+            try {
+              await img.decode();
+            } catch {
+              // Fallback safely if decode rejects
+            }
+          }
           if (cancelled) {
             resolve(false);
             return;
           }
           imagesRef.current[idx] = img;
-          // If this frame is currently displayed (or very close), refresh canvas cleanly
           if (Math.abs(displayFrameRef.current - idx) <= 2) {
             drawFrameToCanvas(displayFrameRef.current, true);
           }
@@ -260,7 +388,6 @@ export function BouquetHero({
     };
 
     const runPreload = async () => {
-      // Wave 0: Load opening frame & final frame immediately so hero paints in <100ms
       const initialIdx = isReducedMotion ? TOTAL_FRAMES - 1 : 0;
       const [firstOk] = await Promise.all([
         loadSingleFrame(initialIdx),
@@ -281,7 +408,7 @@ export function BouquetHero({
       setIsReady(true);
       drawFrameToCanvas(initialIdx, true);
 
-      // Wave 1: Load every 4th frame first so full-range scrubbing is immediately smooth on mobile
+      // Wave 1: Every 4th frame first for immediate full-range scrubbing on mobile
       const wave1: number[] = [];
       const wave2: number[] = [];
       for (let i = 1; i < TOTAL_FRAMES - 1; i++) {
@@ -304,7 +431,7 @@ export function BouquetHero({
 
       await loadInBatches(wave1, 6);
       if (cancelled) return;
-      await loadInBatches(wave2, 6);
+      await loadInBatches(wave2, 4);
     };
 
     runPreload();
@@ -314,43 +441,12 @@ export function BouquetHero({
     };
   }, [isReducedMotion, retryTick, drawFrameToCanvas]);
 
-  // Silky 60fps requestAnimationFrame loop with smooth exponential damping
-  useEffect(() => {
-    if (!isReady || isReducedMotion) return;
-
-    const tick = () => {
-      const target = targetFrameRef.current;
-      const current = displayFrameRef.current;
-      const diff = target - current;
-
-      if (Math.abs(diff) > 0.04) {
-        // Smooth damping makes touch flicks & wheel notches feel cinema-fluid
-        const next = current + diff * 0.24;
-        displayFrameRef.current = next;
-        drawFrameToCanvas(next);
-      } else if (Math.round(current) !== Math.round(target)) {
-        displayFrameRef.current = target;
-        drawFrameToCanvas(target);
-      }
-
-      rafIdRef.current = requestAnimationFrame(tick);
-    };
-
-    rafIdRef.current = requestAnimationFrame(tick);
-
-    return () => {
-      if (rafIdRef.current !== null) {
-        cancelAnimationFrame(rafIdRef.current);
-        rafIdRef.current = null;
-      }
-    };
-  }, [isReady, isReducedMotion, drawFrameToCanvas]);
-
-  // GSAP ScrollTrigger over native CSS sticky track (zero mobile pin jitter!)
+  // GSAP ScrollTrigger over native CSS sticky track (ignoreMobileResize prevents URL-bar hitches)
   useEffect(() => {
     if (typeof window === "undefined" || !isReady || isReducedMotion) return;
 
     gsap.registerPlugin(ScrollTrigger);
+    ScrollTrigger.config({ ignoreMobileResize: true });
 
     const track = trackRef.current;
     if (!track) return;
@@ -387,6 +483,7 @@ export function BouquetHero({
           onUpdate: (self) => {
             const progress = Math.max(0, Math.min(1, self.progress));
             targetFrameRef.current = progress * (TOTAL_FRAMES - 1);
+            scheduleRender();
 
             if (finalOverlayRef.current) {
               finalOverlayRef.current.style.pointerEvents =
@@ -430,7 +527,7 @@ export function BouquetHero({
     return () => {
       ctx.revert();
     };
-  }, [isReady, isReducedMotion]);
+  }, [isReady, isReducedMotion, scheduleRender]);
 
   // Accessible manual playback for reduced-motion users
   useEffect(() => {
@@ -498,10 +595,12 @@ export function BouquetHero({
       data-video-source={videoSrc}
       aria-label="Bouqcakes Edible Floral Bouquet Assembly"
       className={`relative w-full bg-[#9E8E78] ${
-        isReducedMotion ? "h-svh min-h-[540px]" : "h-[260svh] md:h-[300svh] lg:h-[340vh]"
+        isReducedMotion
+          ? "h-svh min-h-[540px]"
+          : "h-[260svh] md:h-[300svh] lg:h-[340vh]"
       } ${className}`}
     >
-      {/* Native GPU-Composited Sticky Stage — silky smooth on every iPhone, Android, tablet, and desktop */}
+      {/* Native GPU-Composited Sticky Stage */}
       <div className="sticky top-0 left-0 w-full h-svh min-h-[540px] overflow-hidden bg-[#9E8E78]">
         {/* Interactive Canvas Sequence Stage */}
         <canvas
@@ -531,7 +630,7 @@ export function BouquetHero({
             className="absolute inset-0 z-20 pointer-events-none flex flex-col justify-end items-center px-5 sm:px-8 pb-6 sm:pb-9"
           >
             <div className="flex flex-col items-center gap-2.5">
-              <div className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-[#F5EEE5]/92 backdrop-blur-md border border-[#D9B9B2]">
+              <div className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-[#F5EEE5]/95 border border-[#D9B9B2]">
                 <span className="font-sans text-[10px] sm:text-[11px] uppercase tracking-[0.24em] text-[#292321] font-medium">
                   Scroll to Assemble
                 </span>
@@ -579,7 +678,7 @@ export function BouquetHero({
               <a
                 href="#inquire"
                 onClick={(e) => handleSmoothAnchor(e, "inquire")}
-                className="w-full sm:w-auto inline-flex items-center justify-center px-7 py-3.5 rounded-full bg-[#481923]/65 backdrop-blur-md text-[#F5EEE5] border border-[#D9B9B2]/50 font-sans text-[11px] sm:text-xs uppercase tracking-[0.22em] transition-colors duration-300 hover:bg-[#F5EEE5] hover:text-[#481923] hover:border-[#F5EEE5]"
+                className="w-full sm:w-auto inline-flex items-center justify-center px-7 py-3.5 rounded-full bg-[#481923]/80 text-[#F5EEE5] border border-[#D9B9B2]/50 font-sans text-[11px] sm:text-xs uppercase tracking-[0.22em] transition-colors duration-300 hover:bg-[#F5EEE5] hover:text-[#481923] hover:border-[#F5EEE5]"
               >
                 Inquire
               </a>
@@ -604,7 +703,7 @@ export function BouquetHero({
             <button
               type="button"
               onClick={() => setIsPlayingReduced((prev) => !prev)}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-[#F5EEE5]/92 backdrop-blur-md text-[#292321] border border-[#D9B9B2] font-sans text-[11px] uppercase tracking-[0.2em] hover:bg-[#8F1728] hover:text-[#F5EEE5] hover:border-[#8F1728] transition-colors cursor-pointer"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-[#F5EEE5]/95 text-[#292321] border border-[#D9B9B2] font-sans text-[11px] uppercase tracking-[0.2em] hover:bg-[#8F1728] hover:text-[#F5EEE5] hover:border-[#8F1728] transition-colors cursor-pointer"
             >
               {isPlayingReduced ? (
                 <>

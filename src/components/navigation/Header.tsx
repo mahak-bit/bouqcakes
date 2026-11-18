@@ -20,7 +20,8 @@ export function Header() {
 
   useEffect(() => {
     const handleScroll = () => {
-      setScrolled(window.scrollY > 24);
+      const next = window.scrollY > 24;
+      setScrolled((prev) => (prev === next ? prev : next));
     };
     handleScroll();
     window.addEventListener("scroll", handleScroll, { passive: true });
@@ -69,10 +70,10 @@ export function Header() {
   return (
     <>
       <header
-        className={`fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${
+        className={`fixed top-0 left-0 right-0 z-50 transition-colors duration-300 ${
           scrolled || mobileMenuOpen
-            ? "bg-[#F5EEE5]/94 backdrop-blur-md border-b border-[#D9B9B2]/65 py-3"
-            : "bg-[#F5EEE5]/74 backdrop-blur-sm border-b border-transparent py-3.5 md:py-4"
+            ? "bg-[#F5EEE5]/96 md:bg-[#F5EEE5]/92 md:backdrop-blur-sm border-b border-[#D9B9B2]/65 py-3"
+            : "bg-[#F5EEE5]/90 md:bg-[#F5EEE5]/75 md:backdrop-blur-sm border-b border-transparent py-3.5 md:py-4"
         }`}
       >
         <div className="editorial-container grid grid-cols-2 lg:grid-cols-[1fr_auto_1fr] items-center gap-4">

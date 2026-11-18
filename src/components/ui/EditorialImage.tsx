@@ -50,7 +50,7 @@ export function EditorialImage({
     ).matches;
     const isDesktop = window.matchMedia("(min-width: 1024px)").matches;
 
-    // Keep mobile lightweight: run subtle parallax on desktop when motion is allowed
+    // Keep mobile lightweight: run subtle parallax only on desktop when motion is allowed
     if (prefersReducedMotion || !isDesktop) return;
 
     const frame = frameRef.current;
@@ -58,6 +58,7 @@ export function EditorialImage({
     if (!frame || !media) return;
 
     gsap.registerPlugin(ScrollTrigger);
+    ScrollTrigger.config({ ignoreMobileResize: true });
 
     const ctx = gsap.context(() => {
       gsap.fromTo(
@@ -70,7 +71,7 @@ export function EditorialImage({
             trigger: frame,
             start: "top bottom",
             end: "bottom top",
-            scrub: 0.75,
+            scrub: 0.6,
           },
         }
       );
@@ -84,32 +85,31 @@ export function EditorialImage({
   return (
     <motion.div
       ref={frameRef}
-      initial={
-        prefersReduced
-          ? { opacity: 1 }
-          : { opacity: 0, clipPath: "inset(6% 0% 0% 0%)" }
-      }
-      whileInView={
-        prefersReduced
-          ? { opacity: 1 }
-          : { opacity: 1, clipPath: "inset(0% 0% 0% 0%)" }
-      }
-      viewport={{ once: true, amount: 0.18 }}
-      transition={{ duration: prefersReduced ? 0 : 1.05, delay, ease: REVEAL_EASE }}
+      initial={prefersReduced ? { opacity: 1 } : { opacity: 0, y: 18 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, amount: 0.15 }}
+      transition={{
+        duration: prefersReduced ? 0 : 0.85,
+        delay,
+        ease: REVEAL_EASE,
+      }}
       className={`relative w-full ${aspectClass} overflow-hidden bg-[#EAE0D4] ${className}`}
     >
       {!hasError && src ? (
         <div
           ref={mediaRef}
           className={`relative w-full ${
-            parallax ? "lg:h-[114%] lg:-top-[7%] h-full" : "h-full"
-          } will-change-transform`}
+            parallax
+              ? "lg:h-[114%] lg:-top-[7%] lg:will-change-transform h-full"
+              : "h-full"
+          }`}
         >
           <Image
             src={src}
             alt={alt}
             fill
             priority={priority}
+            decoding="async"
             sizes={sizes}
             onError={() => setHasError(true)}
             className={`${imageClassName} ${
